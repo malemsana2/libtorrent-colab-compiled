@@ -125,30 +125,7 @@ class TitanEngine:
             # Silence heartbeat logs in main thread to avoid tqdm flicker
             pass
 
-class BackgroundHeartbeat(threading.Thread):
-    def __init__(self, engine):
-        super().__init__()
-        self.engine = engine
-        self.daemon = True
-        self.stop_event = threading.Event()
 
-    def run(self):
-        print("💓 Background Heartbeat Active")
-        while not self.stop_event.is_set():
-            try:
-                msg = f"{self.engine.status}: {self.engine.progress}%"
-                requests.post(f"{BACKEND_URL}/worker/heartbeat", json={
-                    "worker_id": WORKER_ID,
-                    "task_id": self.engine.current_task_id,
-                    "status": self.engine.status,
-                    "status_message": msg,
-                    "progress": self.engine.progress
-                }, headers=HEADERS, timeout=10)
-            except: pass
-            time.sleep(30)
-
-    def stop(self):
-        self.stop_event.set()
 
     def handle_exit(self, signum=None, frame=None):
         """Releases the current task back to the queue on exit or crash"""
@@ -560,6 +537,30 @@ class BackgroundHeartbeat(threading.Thread):
             except Exception as e:
                 print(f"\nPolling Connection Error: {e}")
                 time.sleep(30)
+
+
+class BackgroundHeartbeat(threading.Thread):
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+        self.daemon = True
+        self.stop_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                requests.post(f"{BACKEND_URL}/worker/heartbeat", json={
+                    "worker_id": WORKER_ID,
+                    "task_id": self.engine.current_task_id,
+                    "status": self.engine.status,
+                    "status_message": f"{self.engine.status}: {self.engine.progress}%",
+                    "progress": self.engine.progress
+                }, headers=HEADERS, timeout=10)
+            except: pass
+            time.sleep(30)
+
+    def stop(self):
+        self.stop_event.set()
 
 if __name__ == "__main__":
     engine = TitanEngine()
