@@ -68,8 +68,15 @@ class TitanEngine:
         except: return False
 
     def _setup_git(self):
+        # Global identity
         self.safe_git_op(["git", "config", "--global", "user.email", "titan@aniclip.site"], cwd=self.workspace)
         self.safe_git_op(["git", "config", "--global", "user.name", "TitanWorker"], cwd=self.workspace)
+        
+        # Performance Tuning for Large Video/Encrypted Data Pushes
+        print("⚙️ Tuning Git for High-Performance Large Pushes...")
+        self.safe_git_op(["git", "config", "--global", "http.postBuffer", "524288000"], cwd=self.workspace) # 512MB
+        self.safe_git_op(["git", "config", "--global", "core.compression", "0"], cwd=self.workspace) # Disable git compression
+        self.safe_git_op(["git", "config", "--global", "http.version", "HTTP/1.1"], cwd=self.workspace) # More stable protocol
 
     def get_audio_map(self, input_file):
         try:
@@ -103,6 +110,14 @@ class TitanEngine:
                         continue # Retry the pull (or skip if reset was enough)
                     except: pass
                 
+                # Special recovery for 'git push' RPC / HTTP 500 failure
+                if cmd[1] == 'push' and ('RPC failed' in e.stderr or '500' in e.stderr) and attempt < retries - 1:
+                    print("   🔄 RPC/500 Failure detected. Boosting buffer to 1GB and retrying...")
+                    try:
+                        subprocess.run(["git", "config", "--global", "http.postBuffer", "1048576000"], cwd=cwd)
+                        continue
+                    except: pass
+
                 if attempt == retries - 1:
                     raise e
                 time.sleep(5 * (attempt + 1))
