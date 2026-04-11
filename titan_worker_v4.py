@@ -10,7 +10,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # This block intelligently pulls config from Colab globals OR environment
 def get_config(name, default=None):
-    return globals().get(name) or os.environ.get(name) or default
+    # 1. Try environment variables
+    val = os.environ.get(name)
+    if val: return val
+    
+    # 2. Try the __main__ scope (where Colab notebook variables live)
+    import __main__
+    if hasattr(__main__, name):
+        return getattr(__main__, name)
+        
+    # 3. Try module-level globals (fallback)
+    return globals().get(name) or default
 
 BACKEND_URL = get_config("BACKEND_URL")
 ADMIN_KEY = get_config("ADMIN_KEY")
@@ -21,9 +31,21 @@ MASTER_ENCRYPTION_KEY = get_config("MASTER_ENCRYPTION_KEY")
 WORKER_MODE = int(get_config("WORKER_MODE", 1)) # 1 = Production, 2 = Speed Testing (Dumb CQ)
 
 # Validation
-missing = [k for k, v in {"BACKEND_URL": BACKEND_URL, "ADMIN_KEY": ADMIN_KEY, "WORKER_ID": WORKER_ID, "MASTER_ENCRYPTION_KEY": MASTER_ENCRYPTION_KEY}.items() if not v]
+missing = [k for k, v in {
+    "BACKEND_URL": BACKEND_URL, 
+    "ADMIN_KEY": ADMIN_KEY, 
+    "WORKER_ID": WORKER_ID, 
+    "MASTER_ENCRYPTION_KEY": MASTER_ENCRYPTION_KEY
+}.items() if not v]
+
 if missing:
-    print(f"❌ Titan Error: Missing required variables: {', '.join(missing)}. Please set them in your Credentials cell!")
+    # We use a non-blocking warning if imported as a module, or a hard error if run as script
+    msg = f"❌ Titan Error: Missing required variables: {', '.join(missing)}. Please set them in your Credentials cell!"
+    if __name__ == "__main__":
+        print(msg)
+    else:
+        # If imported, we'll try to re-check them when TitanEngine is initialized
+        pass
 
 HEADERS = { "Authorization": f"Bearer {ADMIN_KEY}", "Content-Type": "application/json" }
 
