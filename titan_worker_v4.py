@@ -462,8 +462,8 @@ class TitanEngine:
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
                     
-                    # --- Multi-Repo Spillover System (Every 10 segments processed) ---
-                    if completed_segments % 10 == 0:
+                    # --- Multi-Repo Spillover System (Every 5 segments processed) ---
+                    if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         if repo_local.exists():
                             dest = repo_local / task['anime_slug'] / f"ep_{task['episode_num']}"
@@ -472,7 +472,7 @@ class TitanEngine:
                             
                             try:
                                 repo_size = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file())
-                                if repo_size > 1.5 * 1024 * 1024 * 1024: # 1.5 GB
+                                if repo_size > 1.0 * 1024 * 1024 * 1024: # 1.0 GB limit (Headroom for 2GB GitHub Pack limit)
                                     print(f"\n🔄 Repository size ({round(repo_size/1024/1024, 2)} MB) nearing limit. Spilling over...")
                                     self.status = "SYNCING"
                                     self.progress = 0
