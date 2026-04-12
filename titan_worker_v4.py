@@ -27,6 +27,7 @@ ADMIN_KEY = get_config("ADMIN_KEY")
 WORKER_ID = get_config("WORKER_ID") or get_config("WORKER_NAME")
 GITHUB_TOKEN = get_config("GITHUB_TOKEN")
 GITHUB_USERNAME = get_config("GITHUB_USERNAME")
+SSH_PRIVATE_KEY = get_config("SSH_PRIVATE_KEY")
 MASTER_ENCRYPTION_KEY = get_config("MASTER_ENCRYPTION_KEY")
 WORKER_MODE = int(get_config("WORKER_MODE", 1)) # 1 = Production, 2 = Speed Testing (Dumb CQ)
 
@@ -59,7 +60,46 @@ class TitanEngine:
         self.status = "IDLE"
         self.progress = 0
         self.current_task_id = None
+        self._setup_ssh()
         self._setup_git()
+
+    def _setup_ssh(self):
+        """Configures SSH for Git operations to avoid HTTP 500/RPC errors on large pushes"""
+        if not SSH_PRIVATE_KEY:
+            print("ℹ️ SSH_PRIVATE_KEY not found. Falling back to GITHUB_TOKEN (HTTPS).")
+            return
+
+        print("🔑 Setting up SSH for Git transport...")
+        ssh_dir = Path.home() / ".ssh"
+        ssh_dir.mkdir(exist_ok=True, parents=True)
+        
+        key_file = ssh_dir / "id_rsa"
+        # Ensure raw multi-line key is stripped of leading/trailing whitespace
+        key_content = SSH_PRIVATE_KEY.strip()
+        
+        with open(key_file, "w") as f:
+            f.write(key_content + "\n")
+        
+        # Security permissions required by SSH
+        os.chmod(key_file, 0o600)
+        
+        # Add GitHub to known_hosts to prevent interactive fingerprint prompts
+        try:
+            res = subprocess.run(["ssh-keyscan", "github.com"], capture_output=True, text=True)
+            if res.returncode == 0:
+                with open(ssh_dir / "known_hosts", "w") as f:
+                    f.write(res.stdout)
+                print("✅ GitHub added to known_hosts.")
+        except Exception as e:
+            print(f"⚠️ Failed to scan GitHub SSH fingerprint: {e}")
+
+    def get_git_url(self, repo_name):
+        """Returns SSH URL if key is present, otherwise HTTPS URL with token"""
+        repo_name = repo_name.replace(" ", "-")
+        if SSH_PRIVATE_KEY:
+            return f"git@github.com:{GITHUB_USERNAME}/{repo_name}.git"
+        else:
+            return f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
 
     def _check_gpu(self):
         try:
@@ -451,8 +491,8 @@ class TitanEngine:
                                     
                                     if "new_storage" in res:
                                         task['storage'] = res['new_storage']
-                                        repo_name = f"{task['storage']['name']}".replace(" ", "-")
-                                        repo_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
+                                        repo_name = f"{task['storage']['name']}"
+                                        repo_url = self.get_git_url(repo_name)
                                         print(f"📦 Resuming with fresh storage unit: {repo_name}")
                                         self.status = "SYNCING"
                                         self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
@@ -460,8 +500,8 @@ class TitanEngine:
                                 print(f"❌ Storage Spillover Check failed: {e}")
                 
             self.status = "SYNCING"
-            repo_name = f"{task['storage']['name']}".replace(" ", "-")
-            repo_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
+            repo_name = f"{task['storage']['name']}"
+            repo_url = self.get_git_url(repo_name)
             repo_local = self.workspace / "repo"
             print(f"📦 Synchronizing to remote repository: {GITHUB_USERNAME}/{repo_name}")
             
