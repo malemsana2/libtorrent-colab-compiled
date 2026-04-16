@@ -60,6 +60,9 @@ class TitanEngine:
         self.status = "IDLE"
         self.progress = 0
         self.current_task_id = None
+        self.task_data = None
+        self.pending_metadata = []
+        self.active_push_thread = None
         self._setup_ssh()
         self._setup_git()
 
@@ -179,6 +182,78 @@ class TitanEngine:
         except Exception as e:
             # Silence heartbeat logs in main thread to avoid tqdm flicker
             pass
+
+    def flush_batch(self, is_final=False):
+        if not self.pending_metadata and not is_final:
+            return
+            
+        repo_local = self.workspace / "repo"
+        task = self.task_data
+        
+        # Ensure previous push has completed before modifying Git index again
+        if self.active_push_thread and self.active_push_thread.is_alive():
+            print("\n⏳ Waiting for previous background push to finish...")
+            self.active_push_thread.join()
+
+        # Commit current batch
+        print(f"\n📦 Preparing {'Final ' if is_final else 'Partial '}Batch Push...")
+        self.status = "SYNCING"
+        
+        if repo_local.exists():
+            # Move local files to repo if output_base still has files from spills
+            dest = repo_local / task['anime_slug'] / f"ep_{task['episode_num']}"
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in self.output_base.glob("*"): shutil.copy(f, dest)
+            for f in self.output_base.glob("*"): os.remove(f)
+            
+            # Git Commit (Fast, synchronous)
+            self.safe_git_op(["git", "add", "."], cwd=repo_local)
+            
+            try:
+                # git commit might fail if there's nothing to commit
+                subprocess.run(["git", "commit", "-m", f"Titan Ingest: {task['task_id']} | Final: {is_final}"], cwd=repo_local, check=True, capture_output=True)
+            except:
+                pass
+
+        # Capture metadata for thread before clearing
+        clips_to_push = list(self.pending_metadata)
+        self.pending_metadata = []
+
+        # Start background push and ingest
+        self.active_push_thread = threading.Thread(
+            target=self._push_worker,
+            args=(repo_local, task, clips_to_push, is_final)
+        )
+        self.active_push_thread.start()
+        
+        # Resume main loop processing
+        self.status = "WORKING"
+
+    def _push_worker(self, repo_local, task, clips_metadata, is_final):
+        try:
+            print("\n🚀 Background Push Started...")
+            if repo_local.exists():
+                self.safe_git_op(["git", "push"], cwd=repo_local)
+            
+            print(f"\n📡 Pushed. Ingesting {len(clips_metadata)} clips to DB...")
+            resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
+                "task_id": task['task_id'],
+                "worker_id": WORKER_ID,
+                "anime_id": task['anime_id'],
+                "episode_id": task['episode_id'],
+                "mal_id": task['mal_id'],
+                "episode_num": task['episode_num'],
+                "raw_clips": clips_metadata,
+                "is_final_batch": is_final
+            }, headers=HEADERS)
+
+            if resp.status_code == 200:
+                print(f"✅ Batch ingested successfully. (Final: {is_final})")
+            else:
+                print(f"❌ Batch Ingest Failed ({resp.status_code}): {resp.text}")
+                
+        except Exception as e:
+            print(f"❌ Background Push/Ingest failed: {e}")
 
 
 
@@ -448,63 +523,13 @@ class TitanEngine:
             repo_local = self.workspace / "repo"
             completed_segments = 0
             
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(self.process_segment, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm)
-                    for i in range(total_segments)
-                ]
-                
-                for future in tqdm(as_completed(futures), total=total_segments, desc="Titan Tasks"):
-                    result = future.result()
-                    if result: 
-                        clips_metadata.append(result)
-                        
-                    completed_segments += 1
-                    self.progress = int((completed_segments / total_segments) * 100)
-                    
-                    # --- Multi-Repo Spillover System (Every 5 segments processed) ---
-                    if completed_segments % 5 == 0:
-                        self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
-                        if repo_local.exists():
-                            dest = repo_local / task['anime_slug'] / f"ep_{task['episode_num']}"
-                            dest.mkdir(parents=True, exist_ok=True)
-                            for f in self.output_base.glob("*"): shutil.copy(f, dest)
-                            
-                            try:
-                                repo_size = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file())
-                                if repo_size > 1.0 * 1024 * 1024 * 1024: # 1.0 GB limit (Headroom for 2GB GitHub Pack limit)
-                                    print(f"\n🔄 Repository size ({round(repo_size/1024/1024, 2)} MB) nearing limit. Spilling over...")
-                                    self.status = "SYNCING"
-                                    self.progress = 0
-                                    self.safe_git_op(["git", "add", "."], cwd=repo_local)
-                                    self.safe_git_op(["git", "commit", "-m", f"Titan spillover checkpoint"], cwd=repo_local)
-                                    self.safe_git_op(["git", "push"], cwd=repo_local)
-                                    
-                                    shutil.rmtree(repo_local)
-                                    for f in self.output_base.glob("*"): os.remove(f)
-                                    
-                                    res = requests.post(f"{BACKEND_URL}/worker/heartbeat", json={
-                                        "worker_id": WORKER_ID, "task_id": self.current_task_id, "status": "WORKING",
-                                        "status_message": "Switching Repo Target", "progress": self.progress,
-                                        "request_new_storage": True
-                                    }, headers=HEADERS).json()
-                                    
-                                    if "new_storage" in res:
-                                        task['storage'] = res['new_storage']
-                                        repo_name = f"{task['storage']['name']}"
-                                        repo_url = self.get_git_url(repo_name)
-                                        print(f"📦 Resuming with fresh storage unit: {repo_name}")
-                                        self.status = "SYNCING"
-                                        self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
-                            except Exception as e:
-                                print(f"❌ Storage Spillover Check failed: {e}")
-                
-            self.status = "SYNCING"
+            self.task_data = task
+            self.pending_metadata = []
+            
             repo_name = f"{task['storage']['name']}"
             repo_url = self.get_git_url(repo_name)
-            repo_local = self.workspace / "repo"
-            print(f"📦 Synchronizing to remote repository: {GITHUB_USERNAME}/{repo_name}")
             
+            # Setup repository cloning ONCE at the start of the job
             if repo_local.exists():
                 try:
                     origin_url = subprocess.check_output(["git", "config", "--get", "remote.origin.url"], cwd=repo_local).decode().strip()
@@ -520,30 +545,69 @@ class TitanEngine:
             else:
                 self.status = "SYNCING"
                 self.safe_git_op(["git", "pull"], cwd=repo_local)
+                
+            self.status = "WORKING"
             
-            dest = repo_local / task['anime_slug'] / f"ep_{task['episode_num']}"
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in self.output_base.glob("*"): shutil.copy(f, dest)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(self.process_segment, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm)
+                    for i in range(total_segments)
+                ]
+                
+                for future in tqdm(as_completed(futures), total=total_segments, desc="Titan Tasks"):
+                    result = future.result()
+                    if result: 
+                        self.pending_metadata.append(result)
+                        
+                    completed_segments += 1
+                    self.progress = int((completed_segments / total_segments) * 100)
+                    
+                    if completed_segments % 5 == 0:
+                        self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
+                        
+                    # Trigger batch flush every 35 segments
+                    repo_size_mb = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if repo_local.exists() else 0
+                    
+                    if len(self.pending_metadata) >= 35 or (repo_size_mb > 800 and len(self.pending_metadata) > 0):
+                        self.flush_batch(is_final=False)
+                        
+                        # --- Multi-Repo Spillover System ---
+                        repo_size_mb = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if repo_local.exists() else 0
+                        if repo_size_mb > 1800: # 1.8 GB 
+                            print(f"\n🔄 Repository size nearing strict limit ({repo_size_mb:.2f} MB). Wait & spillover...")
+                            
+                            # MUST wait for pushes to complete before completely switching directories mid-task!
+                            if self.active_push_thread and self.active_push_thread.is_alive():
+                                print("⏳ Waiting for pending pushes before changing repo...")
+                                self.active_push_thread.join()
+                                
+                            shutil.rmtree(repo_local)
+                            
+                            res = requests.post(f"{BACKEND_URL}/worker/heartbeat", json={
+                                "worker_id": WORKER_ID, "task_id": self.current_task_id, "status": "WORKING",
+                                "status_message": "Switching Repo Target", "progress": self.progress,
+                                "request_new_storage": True
+                            }, headers=HEADERS).json()
+                            
+                            if "new_storage" in res:
+                                task['storage'] = res['new_storage']
+                                self.task_data = task
+                                repo_name = f"{task['storage']['name']}"
+                                repo_url = self.get_git_url(repo_name)
+                                print(f"📦 Resuming with fresh storage unit: {repo_name}")
+                                self.status = "SYNCING"
+                                self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
+                                self.status = "WORKING"
+                
+            # Final Batch Flush
+            self.flush_batch(is_final=True)
             
-            self.status = "SYNCING"
-            self.safe_git_op(["git", "add", "."], cwd=repo_local)
-            self.safe_git_op(["git", "commit", "-m", f"Titan ingestion Task: {task['task_id']}"], cwd=repo_local)
-            self.safe_git_op(["git", "push"], cwd=repo_local)
-            
-            resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
-                "task_id": task['task_id'],
-                "worker_id": WORKER_ID,
-                "anime_id": task['anime_id'],
-                "episode_id": task['episode_id'],
-                "mal_id": task['mal_id'],
-                "episode_num": task['episode_num'],
-                "raw_clips": clips_metadata
-            }, headers=HEADERS)
+            # Wait for final push completion before claiming we are truly DONE
+            if self.active_push_thread and self.active_push_thread.is_alive():
+                 print("\n⏳ Flushing final batch and awaiting ingestion...")
+                 self.active_push_thread.join()
 
-            if resp.status_code == 200:
-                print(f"✅ Task {task['task_id']} Completed and Ingested.")
-            else:
-                print(f"❌ Ingest Failed ({resp.status_code}): {resp.text}")
+            print(f"✅ Task {task['task_id']} Completed.")
                 
         finally:
             self.status = "IDLE"
