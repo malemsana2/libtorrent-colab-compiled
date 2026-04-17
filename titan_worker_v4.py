@@ -570,10 +570,10 @@ class TitanEngine:
                     if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
-                    # Trigger batch flush every 35 segments
-                    repo_size_mb = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if repo_local.exists() else 0
+                    # Trigger batch flush every 35 segments OR if batch size is large
+                    batch_size_mb = sum(os.path.getsize(self.output_base / f) for f in self.output_base.glob("*") if (self.output_base / f).is_file()) / (1024 * 1024)
                     
-                    if len(self.pending_metadata) >= 35 or (repo_size_mb > 800 and len(self.pending_metadata) > 0):
+                    if len(self.pending_metadata) >= 35 or batch_size_mb > 500:
                         self.flush_batch(is_final=False)
                         
                         # --- Multi-Repo Spillover System ---
