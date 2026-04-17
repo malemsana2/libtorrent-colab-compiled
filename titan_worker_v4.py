@@ -200,12 +200,10 @@ class TitanEngine:
         self.status = "SYNCING"
         
         if repo_local.exists():
-            # Move local files to repo if output_base still has files from spills
-            dest = repo_local / task['anime_slug'] / f"ep_{task['episode_num']}"
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in self.output_base.glob("*"): shutil.copy(f, dest)
-            for f in self.output_base.glob("*"): os.remove(f)
-            
+            # REMOVED: output_base aggressive moving. 
+            # Segments now move their own encrypted files directly to repo_local when they finish.
+            # This prevents file corruption of active concurrent FFmpeg thread files.
+
             # Git Commit (Fast, synchronous)
             self.safe_git_op(["git", "add", "."], cwd=repo_local)
             
@@ -424,6 +422,13 @@ class TitanEngine:
                 if os.path.exists(temp_path):
                     enc_path = encrypt_file(temp_path, MASTER_ENCRYPTION_KEY, episode_token, cid)
                     os.remove(temp_path)
+                    
+                    # Safely move completed enc file to final repo early so flush_batch doesn't touch output_base
+                    dest_dir = self.workspace / "repo" / task['anime_slug'] / f"ep_{task['episode_num']}"
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    final_path = dest_dir / os.path.basename(enc_path)
+                    shutil.move(enc_path, final_path)
+                    
                     out_files_map[f_key] = f"{task['anime_slug']}/ep_{task['episode_num']}/{os.path.basename(enc_path)}"
             
             return {
