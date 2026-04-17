@@ -56,6 +56,11 @@ class TitanEngine:
         self.workspace.mkdir(exist_ok=True)
         # Use RAM Disk for all transient I/O to avoid VM disk bottlenecks
         self.output_base = Path("/dev/shm/titan_output") if sys.platform.startswith("linux") else self.workspace / "output"
+        
+        # Staging Area: Decouples FFmpeg workers from Git Repo to prevent race conditions
+        self.staging_dir = self.workspace / "staging"
+        self.staging_dir.mkdir(exist_ok=True)
+        
         self.has_gpu = self._check_gpu()
         self.status = "IDLE"
         self.progress = 0
@@ -200,9 +205,15 @@ class TitanEngine:
         self.status = "SYNCING"
         
         if repo_local.exists():
-            # REMOVED: output_base aggressive moving. 
-            # Segments now move their own encrypted files directly to repo_local when they finish.
-            # This prevents file corruption of active concurrent FFmpeg thread files.
+            # Safely sweep Staging Area contents into the live Repository
+            if self.staging_dir.exists():
+                for root, dirs, files in os.walk(self.staging_dir):
+                    for file in files:
+                        src_file = Path(root) / file
+                        rel_path = src_file.relative_to(self.staging_dir)
+                        dst_file = repo_local / rel_path
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(src_file), str(dst_file))
 
             # Git Commit (Fast, synchronous)
             self.safe_git_op(["git", "add", "."], cwd=repo_local)
@@ -423,8 +434,8 @@ class TitanEngine:
                     enc_path = encrypt_file(temp_path, MASTER_ENCRYPTION_KEY, episode_token, cid)
                     os.remove(temp_path)
                     
-                    # Safely move completed enc file to final repo early so flush_batch doesn't touch output_base
-                    dest_dir = self.workspace / "repo" / task['anime_slug'] / f"ep_{task['episode_num']}"
+                    # Safely move completed enc file to STAGING area to avoid Repo race conditions
+                    dest_dir = self.staging_dir / task['anime_slug'] / f"ep_{task['episode_num']}"
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     final_path = dest_dir / os.path.basename(enc_path)
                     shutil.move(enc_path, final_path)
@@ -480,6 +491,9 @@ class TitanEngine:
             clips_metadata = []
             if self.output_base.exists(): shutil.rmtree(self.output_base)
             self.output_base.mkdir(parents=True)
+            
+            if self.staging_dir.exists(): shutil.rmtree(self.staging_dir)
+            self.staging_dir.mkdir(parents=True)
             
             is_10bit = (bits == '10' or '10le' in fmt)
             
@@ -571,7 +585,7 @@ class TitanEngine:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
                     # Trigger batch flush every 35 segments OR if batch size is large
-                    batch_size_mb = sum(os.path.getsize(self.output_base / f) for f in self.output_base.glob("*") if (self.output_base / f).is_file()) / (1024 * 1024)
+                    batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
                     
                     if len(self.pending_metadata) >= 35 or batch_size_mb > 500:
                         self.flush_batch(is_final=False)
