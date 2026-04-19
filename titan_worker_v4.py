@@ -67,6 +67,8 @@ class TitanEngine:
         self.current_task_id = None
         self.task_data = None
         self.pending_metadata = []
+        self.all_metadata = [] # Accumulates all segment metadata for final atomic ingest
+        self.fatal_error = False # Flag to stop main loop if background push fail
         self.active_push_thread = None
         self._setup_ssh()
         self._setup_git()
@@ -227,42 +229,53 @@ class TitanEngine:
         # Capture metadata for thread before clearing
         clips_to_push = list(self.pending_metadata)
         self.pending_metadata = []
+        
+        # Capture full metadata snapshot for final ingestion call
+        full_metadata_snapshot = list(self.all_metadata) if is_final else []
 
         # Start background push and ingest
         self.active_push_thread = threading.Thread(
             target=self._push_worker,
-            args=(repo_local, task, clips_to_push, is_final)
+            args=(repo_local, task, clips_to_push, is_final, full_metadata_snapshot)
         )
         self.active_push_thread.start()
         
         # Resume main loop processing
         self.status = "WORKING"
 
-    def _push_worker(self, repo_local, task, clips_metadata, is_final):
+    def _push_worker(self, repo_local, task, clips_metadata, is_final, full_metadata):
         try:
-            print("\n🚀 Background Push Started...")
-            if repo_local.exists():
+            print(f"\n🚀 Background Push Started... (Batch: {len(clips_metadata)} files)")
+            if repo_local.exists() and len(clips_metadata) > 0:
                 self.safe_git_op(["git", "push"], cwd=repo_local)
             
-            print(f"\n📡 Pushed. Ingesting {len(clips_metadata)} clips to DB...")
-            resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
-                "task_id": task['task_id'],
-                "worker_id": WORKER_ID,
-                "anime_id": task['anime_id'],
-                "episode_id": task['episode_id'],
-                "mal_id": task['mal_id'],
-                "episode_num": task['episode_num'],
-                "raw_clips": clips_metadata,
-                "is_final_batch": is_final
-            }, headers=HEADERS)
+            # --- CRITICAL: Atomic Ingestion Change ---
+            # We ONLY call the ingestion API if this is the FINAL batch of the entire task.
+            # This prevents partial data (gaps) from being registered in the DB if a middle batch fails.
+            if is_final:
+                print(f"\n📡 Final Batch. Ingesting ALL {len(full_metadata)} clips to DB...")
+                resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
+                    "task_id": task['task_id'],
+                    "worker_id": WORKER_ID,
+                    "anime_id": task['anime_id'],
+                    "episode_id": task['episode_id'],
+                    "mal_id": task['mal_id'],
+                    "episode_num": task['episode_num'],
+                    "raw_clips": full_metadata,
+                    "is_final_batch": True
+                }, headers=HEADERS)
 
-            if resp.status_code == 200:
-                print(f"✅ Batch ingested successfully. (Final: {is_final})")
+                if resp.status_code == 200:
+                    print(f"✅ Task ingested successfully. (Clips: {len(full_metadata)})")
+                else:
+                    print(f"❌ Final Ingest Failed ({resp.status_code}): {resp.text}")
+                    self.fatal_error = True # Signal main thread to abort or reset
             else:
-                print(f"❌ Batch Ingest Failed ({resp.status_code}): {resp.text}")
+                print(f"✅ Partial Batch Pushed. (Files: {len(clips_metadata)}). Ingestion deferred to end of task.")
                 
         except Exception as e:
             print(f"❌ Background Push/Ingest failed: {e}")
+            self.fatal_error = True # Signal main thread that a batch failed
 
 
 
@@ -457,6 +470,8 @@ class TitanEngine:
 
     def run_job(self, task):
         self.current_task_id = task['task_id']
+        self.all_metadata = []
+        self.fatal_error = False
         
         # Start background heartbeat to prevent watchdog timeouts
         hb = BackgroundHeartbeat(self)
@@ -577,10 +592,15 @@ class TitanEngine:
                     result = future.result()
                     if result: 
                         self.pending_metadata.append(result)
+                        self.all_metadata.append(result)
                         
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
                     
+                    # Check for background failure before proceeding
+                    if self.fatal_error:
+                        raise Exception("Background push failed. Aborting task to prevent partial data.")
+
                     if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
@@ -618,6 +638,10 @@ class TitanEngine:
                                 self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
                                 self.status = "WORKING"
                 
+            # Check for background failure before final flush
+            if self.fatal_error:
+                raise Exception("Background push failed in previous batch. Aborting final flush.")
+
             # Final Batch Flush
             self.flush_batch(is_final=True)
             
@@ -625,6 +649,9 @@ class TitanEngine:
             if self.active_push_thread and self.active_push_thread.is_alive():
                  print("\n⏳ Flushing final batch and awaiting ingestion...")
                  self.active_push_thread.join()
+
+            if self.fatal_error:
+                raise Exception("Final push/ingest failed.")
 
             print(f"✅ Task {task['task_id']} Completed.")
                 
