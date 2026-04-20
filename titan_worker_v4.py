@@ -1,14 +1,70 @@
-import os, sys, time, json, requests, shutil, subprocess, hashlib, threading, signal
+import os, sys, time, json, requests, shutil, subprocess, hashlib, threading, signal, sqlite3
 from pathlib import Path
 import libtorrent as lt
 from tqdm import tqdm
 from video_encryptor import encrypt_file
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 2026-04-20 09:05:00: Fixed Titan Worker Metadata Corruption (Spillover Edge Case).
-# v1.1: Late storage assigning. Meta data wrongly asign must be fixed.
-# Implemented late-binding in flush_batch to ensure storage_id matches the active repo at time of commit.
-version_current = "v1.1: Late storage assigning. Meta data wrongly asign must be fixed."
+class MetadataManager:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Use WAL mode for better concurrency performance
+                conn.execute('PRAGMA journal_mode=WAL')
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS segments (
+                        start_ms INTEGER PRIMARY KEY,
+                        end_ms INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        sources TEXT NOT NULL,
+                        storage_id INTEGER
+                    )
+                ''')
+                conn.commit()
+
+    def is_segment_processed(self, start_ms: int) -> bool:
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM segments WHERE start_ms = ? AND status = ?', (start_ms, 'COMPLETED'))
+                return cursor.fetchone() is not None
+
+    def mark_segment_completed(self, start_ms: int, end_ms: int, sources: str, storage_id: int):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    INSERT OR REPLACE INTO segments (start_ms, end_ms, status, sources, storage_id)
+                    VALUES (?, ?, 'COMPLETED', ?, ?)
+                ''', (start_ms, end_ms, sources, storage_id))
+                conn.commit()
+
+    def get_all_completed_segments(self) -> list:
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute('SELECT start_ms, end_ms, sources, storage_id FROM segments WHERE status = "COMPLETED" ORDER BY start_ms ASC')
+                rows = cursor.fetchall()
+                
+                return [{
+                    "start_ms": row['start_ms'],
+                    "end_ms": row['end_ms'],
+                    "sources": json.loads(row['sources']),
+                    "storage_id": row['storage_id']
+                } for row in rows]
+
+    def reset(self):
+        with self.lock:
+            if self.db_path.exists():
+                self.db_path.unlink()
+            self._init_db()
+
+version_current = "v1.2: Resilience Engine + Incremental Ingestion"
 print(version_current)
 
 # =======================================================================
@@ -72,10 +128,10 @@ class TitanEngine:
         self.progress = 0
         self.current_task_id = None
         self.task_data = None
-        self.pending_metadata = []
-        self.all_metadata = [] # Accumulates all segment metadata for final atomic ingest
+        self.batch_metadata = [] # Tracks segments for the current batch
         self.fatal_error = False # Flag to stop main loop if background push fail
         self.active_push_thread = None
+        self.mm = None # Metadata Manager
         self._setup_ssh()
         self._setup_git()
 
@@ -197,7 +253,7 @@ class TitanEngine:
             pass
 
     def flush_batch(self, is_final=False):
-        if not self.pending_metadata and not is_final:
+        if not self.batch_metadata and not is_final:
             return
             
         repo_local = self.workspace / "repo"
@@ -234,36 +290,33 @@ class TitanEngine:
 
         # --- LATE-BINDING STORAGE ID ---
         # Apply the current active storage_id to all clips in this batch.
-        # Since these dictionaries are identical references to those in all_metadata, 
-        # this updates the final ingestion payload atomically as well.
         current_storage_id = task['storage']['id']
+        clips_to_push = list(self.batch_metadata)
         for clip in clips_to_push:
             clip['storage_id'] = current_storage_id
             
-        # Capture full metadata snapshot for final ingestion call
-        full_metadata_snapshot = list(self.all_metadata) if is_final else []
+        self.batch_metadata = [] # Clear batch after handing off to push thread
 
         # Start background push and ingest
         self.active_push_thread = threading.Thread(
             target=self._push_worker,
-            args=(repo_local, task, clips_to_push, is_final, full_metadata_snapshot)
+            args=(repo_local, task, clips_to_push, is_final)
         )
         self.active_push_thread.start()
         
         # Resume main loop processing
         self.status = "WORKING"
 
-    def _push_worker(self, repo_local, task, clips_metadata, is_final, full_metadata):
+    def _push_worker(self, repo_local, task, clips_metadata, is_final):
         try:
             print(f"\n🚀 Background Push Started... (Batch: {len(clips_metadata)} files)")
             if repo_local.exists() and len(clips_metadata) > 0:
                 self.safe_git_op(["git", "push"], cwd=repo_local)
             
-            # --- CRITICAL: Atomic Ingestion Change ---
-            # We ONLY call the ingestion API if this is the FINAL batch of the entire task.
-            # This prevents partial data (gaps) from being registered in the DB if a middle batch fails.
-            if is_final:
-                print(f"\n📡 Final Batch. Ingesting ALL {len(full_metadata)} clips to DB...")
+            # --- INCREMENTAL INGESTION ---
+            # We call the ingestion API for every successful push to ensure DB is constantly updated.
+            if len(clips_metadata) > 0 or is_final:
+                print(f"\n📡 Requesting Incremental DB Ingest... (Clips: {len(clips_metadata)})")
                 resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
                     "task_id": task['task_id'],
                     "worker_id": WORKER_ID,
@@ -271,17 +324,18 @@ class TitanEngine:
                     "episode_id": task['episode_id'],
                     "mal_id": task['mal_id'],
                     "episode_num": task['episode_num'],
-                    "raw_clips": full_metadata,
-                    "is_final_batch": True
+                    "raw_clips": clips_metadata,
+                    "is_final_batch": is_final
                 }, headers=HEADERS)
 
                 if resp.status_code == 200:
-                    print(f"✅ Task ingested successfully. (Clips: {len(full_metadata)})")
+                    print(f"✅ Batch ingested successfully.")
+                elif resp.status_code == 403: # Ghost Worker Protection Triggered
+                    print(f"❌ Ingest Rejected (Task Reassigned): {resp.text}")
+                    self.fatal_error = True
                 else:
-                    print(f"❌ Final Ingest Failed ({resp.status_code}): {resp.text}")
-                    self.fatal_error = True # Signal main thread to abort or reset
-            else:
-                print(f"✅ Partial Batch Pushed. (Files: {len(clips_metadata)}). Ingestion deferred to end of task.")
+                    print(f"❌ Ingest Failed ({resp.status_code}): {resp.text}")
+                    self.fatal_error = True
                 
         except Exception as e:
             print(f"❌ Background Push/Ingest failed: {e}")
@@ -292,18 +346,11 @@ class TitanEngine:
     def handle_exit(self, signum=None, frame=None):
         """Releases the current task back to the queue on exit or crash"""
         if self.current_task_id:
-            print(f"\n⚠️ Titan Interrupted. Releasing Task {self.current_task_id}...")
+            print(f"\n⚠️ Titan Interrupted. Releasing Task {self.current_task_id} via fast-exit...")
             try:
-                # Use /tasks/ not /production/tasks/ if BACKEND_URL already includes /production
-                # Or use a fallback logic. Let's try /tasks/ first assuming BACKEND_URL points to /api/production
-                res = requests.post(f"{BACKEND_URL}/tasks/{self.current_task_id}/reset", headers=HEADERS, timeout=5)
-                if res.status_code == 200:
-                    print("✅ Task released successfully.")
-                else:
-                    # Try fallback if the first one failed (in case of URL mapping differences)
-                    requests.post(f"{BACKEND_URL.replace('/production', '')}/production/tasks/{self.current_task_id}/reset", headers=HEADERS, timeout=5)
+                requests.post(f"{BACKEND_URL}/tasks/{self.current_task_id}/reset", headers=HEADERS, timeout=2)
             except Exception as e:
-                print(f"❌ Failed to release task: {e}")
+                pass # Fire and forget! Do not wait
         sys.exit(0)
 
     def download_torrent_file(self, magnet, target_file_path):
@@ -383,6 +430,11 @@ class TitanEngine:
     def process_segment(self, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm):
         """Worker function for parallel segment generation and encryption"""
         start_ms = i * 10000
+        
+        # Incremental Resumption Sync
+        if self.mm and self.mm.is_segment_processed(start_ms):
+            return None # Already safely in DB! Skip FFmpeg CPU work.
+            
         end_ms = (i + 1) * 10000
         ss_float = start_ms / 1000.0
         dur = 10.0
@@ -559,6 +611,32 @@ class TitanEngine:
                 print(f"🚀 FLASH MODE ACTIVE (WORKER_MODE=3). Limiting processing to 2 segments.")
                 total_segments = min(total_segments, 2)
 
+            # 1. INITIALIZE TASK ON BACKEND (Mother Data)
+            try:
+                requests.post(f"{BACKEND_URL}/worker/tasks/{task['task_id']}/initialize", json={
+                    "total_segments": total_segments,
+                    "worker_id": WORKER_ID
+                }, headers=HEADERS, timeout=10)
+            except: pass
+            
+            # 2. METADATA MANAGER CONFIGURATION
+            self.mm = MetadataManager(self.workspace / f"meta_{task['task_id']}.db")
+            
+            # 3. FETCH PROGRESS FOR RESUMPTION
+            print("🔄 Checking server for existing progress...")
+            try:
+                prog_res = requests.get(f"{BACKEND_URL}/worker/tasks/{task['task_id']}/progress", headers=HEADERS, timeout=10)
+                if prog_res.status_code == 200:
+                    completed_starts = prog_res.json().get('completed_segments', [])
+                    if completed_starts:
+                        print(f"⏭️ Found {len(completed_starts)} existing segments on backend. Synchronizing to local state...")
+                        for st in completed_starts:
+                            # We just need to mark them as completed so `is_segment_processed` skips them. 
+                            # We don't need valid sources since they are already ingested to backend DB.
+                            self.mm.mark_segment_completed(st, st + 10000, "{}", task['storage']['id'])
+            except Exception as e:
+                print(f"⚠️ Failed to sync progress from backend: {e}")
+
             # Smart Concurrency limits to 3 concurrent sessions for NVIDIA T4 limits, otherwise higher for CPU processing
             max_workers = 3 if self.has_gpu else 8
             print(f"🚀 Turbo-Processing {total_segments} segments (Pool Threads: {max_workers})...")
@@ -567,7 +645,7 @@ class TitanEngine:
             completed_segments = 0
             
             self.task_data = task
-            self.pending_metadata = []
+            self.batch_metadata = []
             
             repo_name = f"{task['storage']['name']}"
             repo_url = self.get_git_url(repo_name)
@@ -600,8 +678,8 @@ class TitanEngine:
                 for future in tqdm(as_completed(futures), total=total_segments, desc="Titan Tasks"):
                     result = future.result()
                     if result: 
-                        self.pending_metadata.append(result)
-                        self.all_metadata.append(result)
+                        self.batch_metadata.append(result)
+                        self.mm.mark_segment_completed(result['start_ms'], result['end_ms'], json.dumps(result['sources']), task['storage']['id'])
                         
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
@@ -616,7 +694,7 @@ class TitanEngine:
                     # Trigger batch flush every 35 segments OR if batch size is large
                     batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
                     
-                    if len(self.pending_metadata) >= 35 or batch_size_mb > 500:
+                    if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
                         self.flush_batch(is_final=False)
                         
                         # --- Multi-Repo Spillover System ---
