@@ -5,6 +5,12 @@ from tqdm import tqdm
 from video_encryptor import encrypt_file
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# 2026-04-20 09:05:00: Fixed Titan Worker Metadata Corruption (Spillover Edge Case).
+# v1.1: Late storage assigning. Meta data wrongly asign must be fixed.
+# Implemented late-binding in flush_batch to ensure storage_id matches the active repo at time of commit.
+version_current = "v1.1: Late storage assigning. Meta data wrongly asign must be fixed."
+print(version_current)
+
 # =======================================================================
 # 📡 SYSTEM SYNC (Cell-Pasting & Standalone Compatible)
 # =======================================================================
@@ -226,10 +232,14 @@ class TitanEngine:
             except:
                 pass
 
-        # Capture metadata for thread before clearing
-        clips_to_push = list(self.pending_metadata)
-        self.pending_metadata = []
-        
+        # --- LATE-BINDING STORAGE ID ---
+        # Apply the current active storage_id to all clips in this batch.
+        # Since these dictionaries are identical references to those in all_metadata, 
+        # this updates the final ingestion payload atomically as well.
+        current_storage_id = task['storage']['id']
+        for clip in clips_to_push:
+            clip['storage_id'] = current_storage_id
+            
         # Capture full metadata snapshot for final ingestion call
         full_metadata_snapshot = list(self.all_metadata) if is_final else []
 
@@ -457,7 +467,6 @@ class TitanEngine:
             
             return {
                 "start_ms": start_ms, "end_ms": end_ms,
-                "storage_id": task['storage']['id'],
                 "sources": out_files_map
             }
             
