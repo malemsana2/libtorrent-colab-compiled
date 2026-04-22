@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.5: Success-Anchored Persistence + Branch Normalization + Processed column mismatch handle"
+version_current = "v1.6: Strict Git Identity & Verified Commits"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -210,9 +210,8 @@ class TitanEngine:
         except: return False
 
     def _setup_git(self):
-        # Global identity
-        self.safe_git_op(["git", "config", "--global", "user.email", "titan@aniclip.site"], cwd=self.workspace)
-        self.safe_git_op(["git", "config", "--global", "user.name", "TitanWorker"], cwd=self.workspace)
+        # We leave identity settings to be applied locally in the repository 
+        # to avoid global permission contention.
         self.safe_git_op(["git", "config", "--global", "init.defaultBranch", "main"], cwd=self.workspace)
         
         # Performance Tuning for Large Video/Encrypted Data Pushes
@@ -316,10 +315,19 @@ class TitanEngine:
 
             # Git Commit
             self.safe_git_op(["git", "add", "."], cwd=repo_local)
-            try:
-                subprocess.run(["git", "commit", "-m", f"Titan Ingest: {task['task_id']} | Final: {is_final}"], cwd=repo_local, check=True, capture_output=True)
-            except:
-                pass # Nothing to commit is common during incremental syncs
+            
+            # Verify if there's anything to commit before blindly committing.
+            # This prevents silent failures on empty staging causing empty repositories to have no HEAD.
+            status_check = subprocess.run(["git", "status", "--porcelain"], cwd=repo_local, capture_output=True, text=True)
+            if status_check.stdout.strip():
+                try:
+                    subprocess.run(["git", "commit", "-m", f"Titan Ingest: {task['task_id']} | Final: {is_final}"], cwd=repo_local, check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Git Commit Failed: {e.stderr.strip()}", file=sys.stderr)
+                    self.fatal_error = True
+                    return
+            else:
+                print("ℹ️ Nothing to commit. Staging area is clean.")
 
         # --- ATOMIC STORAGE SNAPSHOT ---
         # Capture the current SID at the moment push starts
@@ -714,6 +722,8 @@ class TitanEngine:
                 self.status = "SYNCING"
                 # Clone without assuming 'main' exists yet
                 self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
+                # Force checkout to main branch immediately after clone for fresh repositories
+                self.safe_git_op(["git", "checkout", "-b", "main"], cwd=repo_local)
             else:
                 self.status = "SYNCING"
                 print("🔄 Synchronizing local repository...")
@@ -725,6 +735,10 @@ class TitanEngine:
                 except Exception:
                     print("   ℹ️ Remote is empty or inaccessible. Proceeding with local state.")
                 
+            # Apply strict local identity to ensure we can commit even if global config is locked or missing
+            self.safe_git_op(["git", "config", "user.email", "titan@aniclip.site"], cwd=repo_local)
+            self.safe_git_op(["git", "config", "user.name", "TitanWorker"], cwd=repo_local)
+
             self.status = "WORKING"
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
