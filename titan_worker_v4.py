@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.4: Success-Anchored Persistence + Branch Normalization"
+version_current = "v1.5: Success-Anchored Persistence + Branch Normalization + Processed column mismatch handle"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -678,9 +678,9 @@ class TitanEngine:
                     if completed_starts:
                         print(f"⏭️ Found {len(completed_starts)} existing segments on backend. Synchronizing to local state...")
                         for st in completed_starts:
-                            # We just need to mark them as completed so `is_segment_processed` skips them. 
-                            # We don't need valid sources since they are already ingested to backend DB.
-                            self.mm.mark_segment_completed(st, st + 10000, "{}", task['storage']['id'])
+                            # We just need to mark them as PUSHED so the worker skips both FFmpeg and Pushing. 
+                            # Metadata is anchored to the backend's state.
+                            self.mm.mark_segment_pushed(st, task['storage']['id'])
             except Exception as e:
                 print(f"⚠️ Failed to sync progress from backend: {e}")
 
