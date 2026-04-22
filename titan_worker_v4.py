@@ -62,13 +62,16 @@ class MetadataManager:
                 conn.commit()
 
     def mark_segment_pushed(self, start_ms: int, storage_id: int):
-        """Final state: Successfully reached GitHub and Backend"""
+        """Final state: Successfully reached GitHub and Backend.
+        Uses INSERT OR REPLACE to handle syncs from backend on fresh worker runs."""
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
+                # For PUSHED state synced from backend, we only need start_ms and status 
+                # to trigger the skip logic. end_ms and sources are not critical.
                 conn.execute('''
-                    UPDATE segments SET status = 'PUSHED', storage_id = ?
-                    WHERE start_ms = ?
-                ''', (storage_id, start_ms))
+                    INSERT OR REPLACE INTO segments (start_ms, end_ms, status, sources, storage_id)
+                    VALUES (?, ? + 10000, 'PUSHED', '{}', ?)
+                ''', (start_ms, start_ms, storage_id))
                 conn.commit()
 
     def get_all_completed_segments(self) -> list:
