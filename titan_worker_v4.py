@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.3: Git-Stream Resilience + Empty Repo Support"
+version_current = "v1.4: Success-Anchored Persistence + Branch Normalization"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -36,20 +36,39 @@ class MetadataManager:
                 ''')
                 conn.commit()
 
-    def is_segment_processed(self, start_ms: int) -> bool:
+    def get_segment_state(self, start_ms: int):
+        """Returns (status, sources, storage_id) for a segment"""
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM segments WHERE start_ms = ? AND status = ?', (start_ms, 'COMPLETED'))
-                return cursor.fetchone() is not None
+                cursor.execute('SELECT status, sources, storage_id FROM segments WHERE start_ms = ?', (start_ms,))
+                row = cursor.fetchone()
+                if not row: return None
+                return {
+                    "status": row['status'],
+                    "sources": json.loads(row['sources']),
+                    "storage_id": row['storage_id']
+                }
 
-    def mark_segment_completed(self, start_ms: int, end_ms: int, sources: str, storage_id: int):
+    def mark_segment_processed(self, start_ms: int, end_ms: int, sources: str):
+        """Internal state: FFmpeg finished, but not yet verified on backend"""
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
-                    INSERT OR REPLACE INTO segments (start_ms, end_ms, status, sources, storage_id)
-                    VALUES (?, ?, 'COMPLETED', ?, ?)
-                ''', (start_ms, end_ms, sources, storage_id))
+                    INSERT OR REPLACE INTO segments (start_ms, end_ms, status, sources)
+                    VALUES (?, ?, 'PROCESSED', ?)
+                ''', (start_ms, end_ms, sources))
+                conn.commit()
+
+    def mark_segment_pushed(self, start_ms: int, storage_id: int):
+        """Final state: Successfully reached GitHub and Backend"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    UPDATE segments SET status = 'PUSHED', storage_id = ?
+                    WHERE start_ms = ?
+                ''', (storage_id, start_ms))
                 conn.commit()
 
     def get_all_completed_segments(self) -> list:
@@ -57,7 +76,7 @@ class MetadataManager:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                cursor.execute('SELECT start_ms, end_ms, sources, storage_id FROM segments WHERE status = "COMPLETED" ORDER BY start_ms ASC')
+                cursor.execute('SELECT start_ms, end_ms, sources, storage_id FROM segments WHERE status = "PUSHED" ORDER BY start_ms ASC')
                 rows = cursor.fetchall()
                 
                 return [{
@@ -191,6 +210,7 @@ class TitanEngine:
         # Global identity
         self.safe_git_op(["git", "config", "--global", "user.email", "titan@aniclip.site"], cwd=self.workspace)
         self.safe_git_op(["git", "config", "--global", "user.name", "TitanWorker"], cwd=self.workspace)
+        self.safe_git_op(["git", "config", "--global", "init.defaultBranch", "main"], cwd=self.workspace)
         
         # Performance Tuning for Large Video/Encrypted Data Pushes
         print("⚙️ Tuning Git for High-Performance Large Pushes...")
@@ -291,47 +311,43 @@ class TitanEngine:
                         dst_file.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(src_file), str(dst_file))
 
-            # Git Commit (Fast, synchronous)
+            # Git Commit
             self.safe_git_op(["git", "add", "."], cwd=repo_local)
-            
             try:
-                # git commit might fail if there's nothing to commit
                 subprocess.run(["git", "commit", "-m", f"Titan Ingest: {task['task_id']} | Final: {is_final}"], cwd=repo_local, check=True, capture_output=True)
             except:
-                pass
+                pass # Nothing to commit is common during incremental syncs
 
-        # --- LATE-BINDING STORAGE ID ---
-        # Apply the current active storage_id to all clips in this batch.
-        current_storage_id = task['storage']['id']
+        # --- ATOMIC STORAGE SNAPSHOT ---
+        # Capture the current SID at the moment push starts
+        current_sid = task['storage']['id']
         clips_to_push = list(self.batch_metadata)
         for clip in clips_to_push:
-            clip['storage_id'] = current_storage_id
+            clip['storage_id'] = current_sid
             
         self.batch_metadata = [] # Clear batch after handing off to push thread
 
         # Start background push and ingest
         self.active_push_thread = threading.Thread(
             target=self._push_worker,
-            args=(repo_local, task, clips_to_push, is_final)
+            args=(repo_local, task, clips_to_push, current_sid, is_final)
         )
         self.active_push_thread.start()
         
         # Resume main loop processing
         self.status = "WORKING"
 
-    def _push_worker(self, repo_local, task, clips_metadata, is_final):
+    def _push_worker(self, repo_local, task, clips_metadata, storage_id, is_final):
         try:
             print(f"\n🚀 Background Push Started... (Batch: {len(clips_metadata)} files)")
             if repo_local.exists() and len(clips_metadata) > 0:
-                # Use branch-agnostic push with upstream tracking for first-time pushes to empty repos
+                # Use branch-agnostic push with upstream tracking
                 try:
-                    self.safe_git_op(["git", "push", "-u", "origin", "main"], cwd=repo_local)
+                    self.safe_git_op(["git", "push", "-u", "origin", "HEAD:main"], cwd=repo_local)
                 except:
-                    # Fallback to simple push if -u fails (usually branch already exists)
-                    self.safe_git_op(["git", "push"], cwd=repo_local)
+                    self.safe_git_op(["git", "push", "origin", "HEAD:main"], cwd=repo_local)
             
             # --- INCREMENTAL INGESTION ---
-            # We call the ingestion API for every successful push to ensure DB is constantly updated.
             if len(clips_metadata) > 0 or is_final:
                 print(f"\n📡 Requesting Incremental DB Ingest... (Clips: {len(clips_metadata)})")
                 resp = requests.post(f"{BACKEND_URL}/worker/ingest", json={
@@ -346,8 +362,12 @@ class TitanEngine:
                 }, headers=HEADERS)
 
                 if resp.status_code == 200:
-                    print(f"✅ Batch ingested successfully.")
-                elif resp.status_code == 403: # Ghost Worker Protection Triggered
+                    print(f"✅ Batch ingested successfully. Anchoring success to local SQLite...")
+                    # --- SUCCESS-ANCHORED PERSISTENCE ---
+                    # Mark segments as PUSHED only AFTER backend confirms ingestion
+                    for clip in clips_metadata:
+                        self.mm.mark_segment_pushed(clip['start_ms'], storage_id)
+                elif resp.status_code == 403:
                     print(f"❌ Ingest Rejected (Task Reassigned): {resp.text}")
                     self.fatal_error = True
                 else:
@@ -448,9 +468,19 @@ class TitanEngine:
         """Worker function for parallel segment generation and encryption"""
         start_ms = i * 10000
         
-        # Incremental Resumption Sync
-        if self.mm and self.mm.is_segment_processed(start_ms):
-            return None # Already safely in DB! Skip FFmpeg CPU work.
+        # --- DUAL-STATE RESUMPTION SYNC ---
+        state = self.mm.get_segment_state(start_ms)
+        if state:
+            if state['status'] == 'PUSHED':
+                return None # Skip entirely
+            if state['status'] == 'PROCESSED':
+                # Check if files still exist in staging before skipping FFmpeg
+                missing_file = False
+                for fpath in state['sources'].values():
+                    if not (self.workspace / "repo" / fpath).exists() and not (self.staging_dir / fpath).exists():
+                        missing_file = True; break
+                if not missing_file:
+                    return { "start_ms": start_ms, "end_ms": start_ms + 10000, "sources": state['sources'] }
             
         end_ms = (i + 1) * 10000
         ss_float = start_ms / 1000.0
@@ -704,7 +734,8 @@ class TitanEngine:
                     result = future.result()
                     if result: 
                         self.batch_metadata.append(result)
-                        self.mm.mark_segment_completed(result['start_ms'], result['end_ms'], json.dumps(result['sources']), task['storage']['id'])
+                        # Mark as PROCESSED locally as soon as FFmpeg finishes
+                        self.mm.mark_segment_processed(result['start_ms'], result['end_ms'], json.dumps(result['sources']))
                         
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
@@ -716,20 +747,22 @@ class TitanEngine:
                     if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
-                    # Trigger batch flush every 35 segments OR if batch size is large
+                    # Trigger batch flush
                     batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
-                    
                     if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
                         self.flush_batch(is_final=False)
                         
-                        # --- Multi-Repo Spillover System ---
+                        # --- MULTI-REPO SPILLOVER (ATOMIC PROTECTION) ---
                         repo_size_mb = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if repo_local.exists() else 0
                         if repo_size_mb > 1800: # 1.8 GB 
-                            print(f"\n🔄 Repository size nearing strict limit ({repo_size_mb:.2f} MB). Wait & spillover...")
+                            print(f"\n🔄 Repository size nearing strict limit ({repo_size_mb:.2f} MB). Draining & Swapping...")
                             
-                            # MUST wait for pushes to complete before completely switching directories mid-task!
+                            # 1. Force a flush of current metadata before swapping repos
+                            self.flush_batch(is_final=False)
+                            
+                            # 2. MUST wait for the drain push to complete before clearing context
                             if self.active_push_thread and self.active_push_thread.is_alive():
-                                print("⏳ Waiting for pending pushes before changing repo...")
+                                print("⏳ Finalizing drain push before lane swap...")
                                 self.active_push_thread.join()
                                 
                             shutil.rmtree(repo_local)
@@ -747,7 +780,9 @@ class TitanEngine:
                                 repo_url = self.get_git_url(repo_name)
                                 print(f"📦 Resuming with fresh storage unit: {repo_name}")
                                 self.status = "SYNCING"
+                                # Reset branch locally to match remote repo lanes
                                 self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
+                                self.safe_git_op(["git", "checkout", "-b", "main"], cwd=repo_local)
                                 self.status = "WORKING"
                 
             # Check for background failure before final flush
