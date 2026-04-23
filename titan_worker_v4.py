@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.7: Persistent Identity across Multi-Repo Spillovers"
+version_current = "v1.8: Memory Isolation (Ghost State Bugfix)"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -588,9 +588,14 @@ class TitanEngine:
             return None
 
     def run_job(self, task):
+        # 0. STRICT CONTEXT ISOLATION
+        # Completely clear all memory state to prevent "Ghost Bleed-over" from previously crashed jobs.
         self.current_task_id = task['task_id']
+        self.task_data = task
         self.all_metadata = []
+        self.batch_metadata = [] 
         self.fatal_error = False
+        self.active_push_thread = None
         
         # Start background heartbeat to prevent watchdog timeouts
         hb = BackgroundHeartbeat(self)
