@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.6: Strict Git Identity & Verified Commits"
+version_current = "v1.7: Persistent Identity across Multi-Repo Spillovers"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -800,6 +800,11 @@ class TitanEngine:
                                 # Reset branch locally to match remote repo lanes
                                 self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
                                 self.safe_git_op(["git", "checkout", "-b", "main"], cwd=repo_local)
+                                
+                                # Re-apply strict local identity to the newly cloned repository
+                                self.safe_git_op(["git", "config", "user.email", "titan@aniclip.site"], cwd=repo_local)
+                                self.safe_git_op(["git", "config", "user.name", "TitanWorker"], cwd=repo_local)
+                                
                                 self.status = "WORKING"
                 
             # Check for background failure before final flush
