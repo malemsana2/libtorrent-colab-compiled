@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.8: Memory Isolation (Ghost State Bugfix)"
+version_current = "v1.9: Memory Isolation (Ghost State Bugfix + repo name printing)"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -299,7 +299,8 @@ class TitanEngine:
             self.active_push_thread.join()
 
         # Commit current batch
-        print(f"\n📦 Preparing {'Final ' if is_final else 'Partial '}Batch Push...")
+        repo_name = task.get('storage', {}).get('name', 'Unknown Repo')
+        print(f"\n📦 Preparing {'Final ' if is_final else 'Partial '}Batch Push to [{repo_name}]...")
         self.status = "SYNCING"
         
         if repo_local.exists():
@@ -350,7 +351,8 @@ class TitanEngine:
 
     def _push_worker(self, repo_local, task, clips_metadata, storage_id, is_final):
         try:
-            print(f"\n🚀 Background Push Started... (Batch: {len(clips_metadata)} files)")
+            repo_name = task.get('storage', {}).get('name', 'Unknown Repo')
+            print(f"\n🚀 Background Push Started to [{repo_name}]... (Batch: {len(clips_metadata)} files)")
             if repo_local.exists() and len(clips_metadata) > 0:
                 # Use branch-agnostic push with upstream tracking
                 try:
