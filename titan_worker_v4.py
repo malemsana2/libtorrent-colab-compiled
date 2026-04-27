@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v1.9: Memory Isolation (Ghost State Bugfix + repo name printing)"
+version_current = "v2.0: Pipelined Dual-Lane Repository System"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -160,10 +160,24 @@ class TitanEngine:
         self.task_data = None
         self.batch_metadata = [] # Tracks segments for the current batch
         self.fatal_error = False # Flag to stop main loop if background push fail
-        self.active_push_thread = None
+        self.active_pushes = {} # Tracks background pushes by storage_id
         self.mm = None # Metadata Manager
         self._setup_ssh()
         self._setup_git()
+        self._cleanup_zombie_repos()
+
+    def _cleanup_zombie_repos(self):
+        """Removes leftover repo_* folders from previous crashed runs to free disk space."""
+        for entry in self.workspace.glob("repo_*"):
+            if entry.is_dir():
+                try:
+                    shutil.rmtree(entry)
+                    print(f"🧹 Cleaned up zombie repo: {entry.name}")
+                except Exception as e:
+                    print(f"⚠️ Failed to clean up {entry.name}: {e}")
+
+    def get_repo_path(self, storage_id):
+        return self.workspace / f"repo_{storage_id}"
 
     def _setup_ssh(self):
         """Configures SSH for Git operations to avoid HTTP 500/RPC errors on large pushes"""
@@ -286,17 +300,18 @@ class TitanEngine:
             # Silence heartbeat logs in main thread to avoid tqdm flicker
             pass
 
-    def flush_batch(self, is_final=False):
+    def flush_batch(self, is_final=False, spillover_drain=False):
         if not self.batch_metadata and not is_final:
             return
             
-        repo_local = self.workspace / "repo"
         task = self.task_data
+        current_sid = task['storage']['id']
+        repo_local = self.get_repo_path(current_sid)
         
-        # Ensure previous push has completed before modifying Git index again
-        if self.active_push_thread and self.active_push_thread.is_alive():
-            print("\n⏳ Waiting for previous background push to finish...")
-            self.active_push_thread.join()
+        # Ensure previous push FOR THIS SPECIFIC REPO has completed before modifying Git index again
+        if current_sid in self.active_pushes and self.active_pushes[current_sid].is_alive():
+            print(f"\n⏳ Waiting for previous background push to finish for Lane {current_sid}...")
+            self.active_pushes[current_sid].join()
 
         # Commit current batch
         repo_name = task.get('storage', {}).get('name', 'Unknown Repo')
@@ -304,15 +319,15 @@ class TitanEngine:
         self.status = "SYNCING"
         
         if repo_local.exists():
-            # Safely sweep Staging Area contents into the live Repository
+            # Safely sweep ONLY the files meant for the current batch
             if self.staging_dir.exists():
-                for root, dirs, files in os.walk(self.staging_dir):
-                    for file in files:
-                        src_file = Path(root) / file
-                        rel_path = src_file.relative_to(self.staging_dir)
-                        dst_file = repo_local / rel_path
-                        dst_file.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(src_file), str(dst_file))
+                for clip in self.batch_metadata:
+                    for f_key, rel_path in clip['sources'].items():
+                        src_file = self.staging_dir / rel_path
+                        if src_file.exists():
+                            dst_file = repo_local / rel_path
+                            dst_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(src_file), str(dst_file))
 
             # Git Commit
             self.safe_git_op(["git", "add", "."], cwd=repo_local)
@@ -332,7 +347,6 @@ class TitanEngine:
 
         # --- ATOMIC STORAGE SNAPSHOT ---
         # Capture the current SID at the moment push starts
-        current_sid = task['storage']['id']
         clips_to_push = list(self.batch_metadata)
         for clip in clips_to_push:
             clip['storage_id'] = current_sid
@@ -340,16 +354,17 @@ class TitanEngine:
         self.batch_metadata = [] # Clear batch after handing off to push thread
 
         # Start background push and ingest
-        self.active_push_thread = threading.Thread(
+        push_thread = threading.Thread(
             target=self._push_worker,
-            args=(repo_local, task, clips_to_push, current_sid, is_final)
+            args=(repo_local, task, clips_to_push, current_sid, is_final, spillover_drain)
         )
-        self.active_push_thread.start()
+        self.active_pushes[current_sid] = push_thread
+        push_thread.start()
         
         # Resume main loop processing
         self.status = "WORKING"
 
-    def _push_worker(self, repo_local, task, clips_metadata, storage_id, is_final):
+    def _push_worker(self, repo_local, task, clips_metadata, storage_id, is_final, spillover_drain):
         try:
             repo_name = task.get('storage', {}).get('name', 'Unknown Repo')
             print(f"\n🚀 Background Push Started to [{repo_name}]... (Batch: {len(clips_metadata)} files)")
@@ -387,6 +402,11 @@ class TitanEngine:
                     print(f"❌ Ingest Failed ({resp.status_code}): {resp.text}")
                     self.fatal_error = True
                 
+            if spillover_drain:
+                print(f"🧹 Spillover Drain completed for Lane {storage_id}. Cleaning up workspace folder...")
+                if repo_local.exists():
+                    shutil.rmtree(repo_local, ignore_errors=True)
+                    
         except Exception as e:
             print(f"❌ Background Push/Ingest failed: {e}")
             self.fatal_error = True # Signal main thread that a batch failed
@@ -597,7 +617,7 @@ class TitanEngine:
         self.all_metadata = []
         self.batch_metadata = [] 
         self.fatal_error = False
-        self.active_push_thread = None
+        self.active_pushes = {}
         
         # Start background heartbeat to prevent watchdog timeouts
         hb = BackgroundHeartbeat(self)
@@ -714,6 +734,8 @@ class TitanEngine:
             
             repo_name = f"{task['storage']['name']}"
             repo_url = self.get_git_url(repo_name)
+            current_sid = task['storage']['id']
+            repo_local = self.get_repo_path(current_sid)
             
             # Setup repository cloning ONCE at the start of the job
             if repo_local.exists():
@@ -733,7 +755,7 @@ class TitanEngine:
                 self.safe_git_op(["git", "checkout", "-b", "main"], cwd=repo_local)
             else:
                 self.status = "SYNCING"
-                print("🔄 Synchronizing local repository...")
+                print(f"🔄 Synchronizing local repository Lane {current_sid}...")
                 # Fetch first to see if anything changed, but don't hard-crash if remote is empty
                 try:
                     subprocess.run(["git", "fetch", "--all"], cwd=repo_local, capture_output=True)
@@ -774,45 +796,49 @@ class TitanEngine:
                     # Trigger batch flush
                     batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
                     if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
-                        self.flush_batch(is_final=False)
                         
                         # --- MULTI-REPO SPILLOVER (ATOMIC PROTECTION) ---
-                        repo_size_mb = sum(f.stat().st_size for f in repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if repo_local.exists() else 0
-                        if repo_size_mb > 1800: # 1.8 GB 
-                            print(f"\n🔄 Repository size nearing strict limit ({repo_size_mb:.2f} MB). Draining & Swapping...")
+                        current_sid = self.task_data['storage']['id']
+                        current_repo_local = self.get_repo_path(current_sid)
+                        repo_size_mb = sum(f.stat().st_size for f in current_repo_local.rglob('*') if f.is_file()) / (1024 * 1024) if current_repo_local.exists() else 0
+                        
+                        is_spillover = repo_size_mb > 1800
+                        
+                        if is_spillover:
+                            print(f"\n🔄 Repository Lane {current_sid} nearing strict limit ({repo_size_mb:.2f} MB). Sealing Lane & Pipelining Swap...")
                             
-                            # 1. Force a flush of current metadata before swapping repos
-                            self.flush_batch(is_final=False)
+                            # 1. Force a final drain flush for the current repo and signal it to self-destruct when done
+                            self.flush_batch(is_final=False, spillover_drain=True)
                             
-                            # 2. MUST wait for the drain push to complete before clearing context
-                            if self.active_push_thread and self.active_push_thread.is_alive():
-                                print("⏳ Finalizing drain push before lane swap...")
-                                self.active_push_thread.join()
-                                
-                            shutil.rmtree(repo_local)
+                            # 2. DO NOT wait for it to finish! (Pipelining advantage)
+                            # We keep processing segments, but fetch a new repo for them to go into.
                             
                             res = requests.post(f"{BACKEND_URL}/worker/heartbeat", json={
                                 "worker_id": WORKER_ID, "task_id": self.current_task_id, "status": "WORKING",
-                                "status_message": "Switching Repo Target", "progress": self.progress,
+                                "status_message": "Pipelining Repo Swap", "progress": self.progress,
                                 "request_new_storage": True
                             }, headers=HEADERS).json()
                             
                             if "new_storage" in res:
                                 task['storage'] = res['new_storage']
                                 self.task_data = task
+                                new_sid = task['storage']['id']
                                 repo_name = f"{task['storage']['name']}"
                                 repo_url = self.get_git_url(repo_name)
-                                print(f"📦 Resuming with fresh storage unit: {repo_name}")
-                                self.status = "SYNCING"
-                                # Reset branch locally to match remote repo lanes
-                                self.safe_git_op(["git", "clone", repo_url, str(repo_local)], cwd=self.workspace)
-                                self.safe_git_op(["git", "checkout", "-b", "main"], cwd=repo_local)
+                                print(f"📦 Resuming processing immediately with fresh storage lane ({new_sid}): {repo_name}")
                                 
-                                # Re-apply strict local identity to the newly cloned repository
-                                self.safe_git_op(["git", "config", "user.email", "titan@aniclip.site"], cwd=repo_local)
-                                self.safe_git_op(["git", "config", "user.name", "TitanWorker"], cwd=repo_local)
+                                new_repo_local = self.get_repo_path(new_sid)
+                                
+                                self.status = "SYNCING"
+                                self.safe_git_op(["git", "clone", repo_url, str(new_repo_local)], cwd=self.workspace)
+                                self.safe_git_op(["git", "checkout", "-b", "main"], cwd=new_repo_local)
+                                
+                                self.safe_git_op(["git", "config", "user.email", "titan@aniclip.site"], cwd=new_repo_local)
+                                self.safe_git_op(["git", "config", "user.name", "TitanWorker"], cwd=new_repo_local)
                                 
                                 self.status = "WORKING"
+                        else:
+                            self.flush_batch(is_final=False)
                 
             # Check for background failure before final flush
             if self.fatal_error:
@@ -821,10 +847,11 @@ class TitanEngine:
             # Final Batch Flush
             self.flush_batch(is_final=True)
             
-            # Wait for final push completion before claiming we are truly DONE
-            if self.active_push_thread and self.active_push_thread.is_alive():
-                 print("\n⏳ Flushing final batch and awaiting ingestion...")
-                 self.active_push_thread.join()
+            # Wait for ALL final push completions before claiming we are truly DONE
+            for sid, push_thread in self.active_pushes.items():
+                if push_thread.is_alive():
+                     print(f"\n⏳ Flushing final batch and awaiting ingestion for Lane {sid}...")
+                     push_thread.join()
 
             if self.fatal_error:
                 raise Exception("Final push/ingest failed.")
