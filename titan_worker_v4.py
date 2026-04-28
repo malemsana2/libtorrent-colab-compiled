@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v2.0: Pipelined Dual-Lane Repository System"
+version_current = "v2.1: Targeted Batch Sizing & Spillover Stability"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -794,7 +794,14 @@ class TitanEngine:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
                     # Trigger batch flush
-                    batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
+                    # FIX: Calculate size based ONLY on the current collected batch metadata to prevent "Single-Clip Flush Loop"
+                    batch_size_mb = sum(
+                        os.path.getsize(self.staging_dir / rel_path) 
+                        for clip in self.batch_metadata 
+                        for rel_path in clip['sources'].values() 
+                        if (self.staging_dir / rel_path).exists()
+                    ) / (1024 * 1024)
+
                     if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
                         
                         # --- MULTI-REPO SPILLOVER (ATOMIC PROTECTION) ---
