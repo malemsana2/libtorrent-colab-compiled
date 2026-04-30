@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v2.1: Targeted Batch Sizing & Spillover Stability"
+version_current = "v2.2: Strict chronological ingestion for ordered playback"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -557,23 +557,33 @@ class TitanEngine:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             subprocess.run(cmd_thumb, check=True, capture_output=True, text=True)
             
-             # --- 20MB Guard Pass 2: Fallback ---
-            if WORKER_MODE == 1:
-                fallback_args = {
-                    "hq": ["-c:v", hq_enc, "-maxrate", "10M", "-bufsize", "20M"],
-                    "prev": ["-c:v", v_enc, "-maxrate", "10M", "-bufsize", "20M"],
-                    "hover": ["-c:v", v_enc, "-maxrate", "5M", "-bufsize", "10M"]
-                }
-                for out_f, pass_args in fallback_args.items():
-                    fpath = f"{self.output_base}/{cid}_{out_f}.mp4"
-                    if os.path.exists(fpath) and os.path.getsize(fpath) > 20_000_000:
-                        tmp_path = f"{self.output_base}/{cid}_{out_f}_tmp.mp4"
-                        shutil.move(fpath, tmp_path)
-                        fallback_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", tmp_path, *pass_args, "-c:a", "copy", fpath]
-                        try:
-                            subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)
-                            os.remove(tmp_path)
-                        except: pass
+            # --- 2. FASTSTART & BITRATE GUARD LAYER ---
+            # We iterate through the generated MP4s to shift the moov atom to the front
+            for suffix in ["hq", "prev", "hover"]:
+                target_f = f"{self.output_base}/{cid}_{suffix}.mp4"
+                if not os.path.exists(target_f): continue
+
+                # Determine if we need bitrate fallback AND apply FastStart regardless
+                file_size = os.path.getsize(target_f)
+                needs_fallback = (WORKER_MODE == 1 and file_size > 20_000_000)
+                
+                fs_tmp = target_f + ".faststart.mp4"
+                
+                if needs_fallback:
+                    # Combined Re-encode + FastStart (Slow path, only for huge files)
+                    pass_args = ["-maxrate", "10M", "-bufsize", "20M"] if suffix != "hover" else ["-maxrate", "5M", "-bufsize", "10M"]
+                    enc = hq_enc if suffix == "hq" else v_enc
+                    fs_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", target_f, "-c:v", enc, *pass_args, "-c:a", "copy", "-movflags", "+faststart", fs_tmp]
+                else:
+                    # Simple Stream Copy + FastStart (Lightning fast path, moves moov atom)
+                    fs_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", target_f, "-c", "copy", "-map", "0", "-movflags", "+faststart", fs_tmp]
+
+                try:
+                    subprocess.run(fs_cmd, check=True, capture_output=True)
+                    os.replace(fs_tmp, target_f)
+                except Exception as e:
+                    if os.path.exists(fs_tmp): os.remove(fs_tmp)
+                    print(f"⚠️ FastStart optimization failed for {suffix}: {e}")
             
             
             # 2. ENCRYPTION LAYER (Within Thread to parallelize CPU-heavy crypto)
@@ -771,17 +781,37 @@ class TitanEngine:
             self.status = "WORKING"
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(self.process_segment, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm)
+                # Map futures to their indices to maintain strict chronological order during ingestion
+                future_to_idx = {
+                    executor.submit(self.process_segment, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm): i 
                     for i in range(total_segments)
-                ]
+                }
                 
-                for future in tqdm(as_completed(futures), total=total_segments, desc="Titan Tasks"):
-                    result = future.result()
+                results_buffer = {}
+                next_idx_to_batch = 0
+                completed_segments = 0
+                
+                for future in tqdm(as_completed(future_to_idx), total=total_segments, desc="Titan Tasks"):
+                    idx = future_to_idx[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        print(f"\n❌ Future for segment {idx} raised exception: {e}")
+                        result = None
+                    
+                    # Store result in buffer (even if None) to preserve sequence
+                    results_buffer[idx] = result
+                    
                     if result: 
-                        self.batch_metadata.append(result)
-                        # Mark as PROCESSED locally as soon as FFmpeg finishes
+                        # Mark as PROCESSED locally as soon as FFmpeg finishes for persistence
                         self.mm.mark_segment_processed(result['start_ms'], result['end_ms'], json.dumps(result['sources']))
+                    
+                    # Pull contiguous completed segments from buffer into batch_metadata
+                    while next_idx_to_batch in results_buffer:
+                        res = results_buffer.pop(next_idx_to_batch)
+                        if res:
+                            self.batch_metadata.append(res)
+                        next_idx_to_batch += 1
                         
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
@@ -793,15 +823,8 @@ class TitanEngine:
                     if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
-                    # Trigger batch flush
-                    # FIX: Calculate size based ONLY on the current collected batch metadata to prevent "Single-Clip Flush Loop"
-                    batch_size_mb = sum(
-                        os.path.getsize(self.staging_dir / rel_path) 
-                        for clip in self.batch_metadata 
-                        for rel_path in clip['sources'].values() 
-                        if (self.staging_dir / rel_path).exists()
-                    ) / (1024 * 1024)
-
+                    # Trigger batch flush (Only if we have chronologically assembled items to flush)
+                    batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
                     if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
                         
                         # --- MULTI-REPO SPILLOVER (ATOMIC PROTECTION) ---
