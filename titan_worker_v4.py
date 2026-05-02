@@ -1,3 +1,4 @@
+
 import os, sys, time, json, requests, shutil, subprocess, hashlib, threading, signal, sqlite3
 from pathlib import Path
 import libtorrent as lt
@@ -10,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v2.2: Strict chronological ingestion for ordered playback"
+version_current = "v2.3: Removed index buffer for batch pushing and fixed clip ID timestamp logic"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -497,10 +498,8 @@ class TitanEngine:
             
         return self.workspace / target_file_path
 
-    def process_segment(self, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm):
+    def process_segment(self, start_ms, end_ms, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm):
         """Worker function for parallel segment generation and encryption"""
-        start_ms = i * 10000
-        
         # --- DUAL-STATE RESUMPTION SYNC ---
         state = self.mm.get_segment_state(start_ms)
         if state:
@@ -513,9 +512,8 @@ class TitanEngine:
                     if not (self.workspace / "repo" / fpath).exists() and not (self.staging_dir / fpath).exists():
                         missing_file = True; break
                 if not missing_file:
-                    return { "start_ms": start_ms, "end_ms": start_ms + 10000, "sources": state['sources'] }
+                    return { "start_ms": start_ms, "end_ms": end_ms, "sources": state['sources'] }
             
-        end_ms = (i + 1) * 10000
         ss_float = start_ms / 1000.0
         dur = 10.0
         cid = self.generate_clip_id(task['mal_id'], task['episode_num'], start_ms, end_ms)
@@ -613,10 +611,10 @@ class TitanEngine:
             }
             
         except subprocess.CalledProcessError as e:
-            print(f"\n❌ FFmpeg Segment {i} Crash Detail:\n{e.stderr}\n")
+            print(f"\n❌ FFmpeg Segment (start: {start_ms}ms) Crash Detail:\n{e.stderr}\n")
             return None
         except Exception as e:
-            print(f"Error processing segment {i}: {e}")
+            print(f"Error processing segment (start: {start_ms}ms): {e}")
             return None
 
     def run_job(self, task):
@@ -781,37 +779,30 @@ class TitanEngine:
             self.status = "WORKING"
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Map futures to their indices to maintain strict chronological order during ingestion
-                future_to_idx = {
-                    executor.submit(self.process_segment, i, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm): i 
-                    for i in range(total_segments)
-                }
+                # Map futures to their segment details to decouple ID generation from completion order
+                future_to_segment = {}
+                for i in range(total_segments):
+                    start = i * 10000
+                    end = (i + 1) * 10000
+                    future = executor.submit(self.process_segment, start, end, task, video_path, audio_map, hq_enc, v_enc, hq_q, prev_q, hover_q, hq_pix_fmt, base_norm, hover_norm)
+                    future_to_segment[future] = (i, start, end)
                 
-                results_buffer = {}
-                next_idx_to_batch = 0
                 completed_segments = 0
                 
-                for future in tqdm(as_completed(future_to_idx), total=total_segments, desc="Titan Tasks"):
-                    idx = future_to_idx[future]
+                for future in tqdm(as_completed(future_to_segment), total=total_segments, desc="Titan Tasks"):
+                    idx, start_ms, end_ms = future_to_segment[future]
                     try:
                         result = future.result()
                     except Exception as e:
-                        print(f"\n❌ Future for segment {idx} raised exception: {e}")
+                        print(f"\n❌ Future for segment {idx} (start: {start_ms}ms) raised exception: {e}")
                         result = None
-                    
-                    # Store result in buffer (even if None) to preserve sequence
-                    results_buffer[idx] = result
                     
                     if result: 
                         # Mark as PROCESSED locally as soon as FFmpeg finishes for persistence
                         self.mm.mark_segment_processed(result['start_ms'], result['end_ms'], json.dumps(result['sources']))
-                    
-                    # Pull contiguous completed segments from buffer into batch_metadata
-                    while next_idx_to_batch in results_buffer:
-                        res = results_buffer.pop(next_idx_to_batch)
-                        if res:
-                            self.batch_metadata.append(res)
-                        next_idx_to_batch += 1
+                        
+                        # Directly append to batch metadata (Order does not matter for ingest)
+                        self.batch_metadata.append(result)
                         
                     completed_segments += 1
                     self.progress = int((completed_segments / total_segments) * 100)
@@ -823,7 +814,7 @@ class TitanEngine:
                     if completed_segments % 5 == 0:
                         self.update_heartbeat(f"Processed Segment {completed_segments}/{total_segments}")
                         
-                    # Trigger batch flush (Only if we have chronologically assembled items to flush)
+                    # Trigger batch flush (Flush straight from the newly appended items)
                     batch_size_mb = sum(f.stat().st_size for f in self.staging_dir.rglob('*') if f.is_file()) / (1024 * 1024) if self.staging_dir.exists() else 0
                     if len(self.batch_metadata) >= 35 or batch_size_mb > 500:
                         
