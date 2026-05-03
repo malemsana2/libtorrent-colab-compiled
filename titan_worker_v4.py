@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =======================================================================
 # AI AGENT INSTRUCTION: Increment this version and append a short summary 
 # after every architectural update or resilience fix.
-version_current = "v2.3: Removed index buffer for batch pushing and fixed clip ID timestamp logic"
+version_current = "v2.4: Enforced temporal sorting of batch metadata before ingestion"
 print(f"📡 Titan Engine: {version_current}")
 # =======================================================================
 
@@ -348,7 +348,7 @@ class TitanEngine:
 
         # --- ATOMIC STORAGE SNAPSHOT ---
         # Capture the current SID at the moment push starts
-        clips_to_push = list(self.batch_metadata)
+        clips_to_push = sorted(list(self.batch_metadata), key=lambda x: x['start_ms'])
         for clip in clips_to_push:
             clip['storage_id'] = current_sid
             
