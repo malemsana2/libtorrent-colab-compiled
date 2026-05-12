@@ -946,7 +946,7 @@ class BackgroundHeartbeat(threading.Thread):
                     "progress": self.engine.progress
                 }, headers=HEADERS, timeout=10)
             except: pass
-            time.sleep(30)
+            time.sleep(10)
 
     def stop(self):
         self.stop_event.set()
